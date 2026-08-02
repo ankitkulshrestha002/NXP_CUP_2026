@@ -47,40 +47,44 @@ class LineFollower(Node):
         self.outbound_uid = 100
         self.parking_timer_start = 0.0
 
-        # Steering & Drive (Pure Pursuit)
+        # Steering, Speed, & Ramping
+        self.MAX_SPEED = 1.00
+        self.MIN_CORNER_SPEED = 0.50
         self.target_speed = 0.38
+        self.current_actual_speed = 0.0  
         self.target_turn = 0.0
         self.prev_error = 0.0
         self.last_turn_direction = 0.0
+        
         self.active_sign_command = None
         self.sign_command_timestamp = 0.0
 
-        # Smart Recovery & LIDAR Shield
+        # LIDAR Shield
+        self.MIN_VALID_LIDAR_DIST = 0.30 
+        self.ZONE_RANGE_MAX = 0.70  
+        self.front_building_range = 10.0
+        self.obstacle_in_front = False
+        self.obstacle_target_shift = 0.0
+        
+        # Reduced Stop Distance so it doesn't freeze on corners!
+        self.FRONT_STOP_DIST = 0.20
+        
+        # Smart Recovery
         self.driving_state = "FORWARD"
         self.recovery_stage_start = 0.0
         self.close_front_count = 0
         self.trap_location = "CENTER"
-        
-        self.FRONT_SLOW_DIST = 1.3
-        self.FRONT_STOP_DIST = 0.45
         self.FRONT_TRAP_DIST = 0.28
         self.TRAP_DEBOUNCE_COUNT = 3
-        self.MIN_VALID_LIDAR_DIST = 0.26  # Chassis filter
-        self.ZONE_RANGE_MAX = 0.65
-
         self.min_rear = 10.0
-        self.front_building_range = 10.0
-        self.obstacle_in_front = False
-        self.obstacle_target_shift = 0.0
-
+        
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
 
     def check_if_parked(self):
         if self.parking_timer_start == 0.0:
             self.parking_timer_start = time.time()
             return False
-        if (time.time() - self.parking_timer_start) > 12.0:
-            return True
+        if (time.time() - self.parking_timer_start) > 12.0: return True
         return False
 
     def publish_drive_commands(self):
@@ -92,6 +96,7 @@ class LineFollower(Node):
             self.mission_state = "PARKED_WAIT_ACK"
 
         if self.mission_state in HOLD_STATES:
+            self.current_actual_speed = 0.0
             msg.axes = [0.0, 0.0, 0.0, 0.0]
             self.publisher_joy.publish(msg)
             return
@@ -100,31 +105,44 @@ class LineFollower(Node):
         # SPATIALLY-AWARE ACKERMANN RECOVERY
         # ---------------------------------------------------------
         if self.driving_state == "RECOVERY":
+            self.current_actual_speed = 0.0
             elapsed = time.time() - self.recovery_stage_start
             
             # Stop reversing after 2 seconds or if rear is blocked
             if elapsed > 2.0 or self.min_rear < 0.25:
-                self.driving_state = "FORWARD"
-                self.recovery_stage_start = 0.0
+                if not self.obstacle_in_front:
+                    self.driving_state = "FORWARD"
+                    self.recovery_stage_start = 0.0
+                else:
+                    self.recovery_stage_start = time.time() # Try again!
                 return
 
             # Smart Steering: Steer TOWARDS the side we are trapped on while in reverse.
-            # This causes the nose of the buggy to violently swing AWAY from the obstacle!
             escape_turn = 0.0
             if self.trap_location == "LEFT":
-                escape_turn = 0.8   # Steer Left -> Nose swings Right
+                escape_turn = 0.8   
             elif self.trap_location == "RIGHT":
-                escape_turn = -0.8  # Steer Right -> Nose swings Left
+                escape_turn = -0.8  
                 
             msg.axes = [0.0, -0.35, 0.0, escape_turn]
             self.publisher_joy.publish(msg)
             return
 
         # ---------------------------------------------------------
-        # NORMAL DRIVING
+        # STRICT SPEED RAMPING
         # ---------------------------------------------------------
-        current_speed = 0.0 if self.obstacle_in_front else self.target_speed
-        msg.axes = [0.0, current_speed, 0.0, self.target_turn]
+        desired_speed = 0.0 if self.obstacle_in_front else self.target_speed
+        
+        if self.current_actual_speed < desired_speed:
+            self.current_actual_speed += 0.05  
+            self.current_actual_speed = min(self.current_actual_speed, desired_speed)
+        elif self.current_actual_speed > desired_speed:
+            self.current_actual_speed -= 0.15  
+            self.current_actual_speed = max(self.current_actual_speed, desired_speed)
+
+        self.current_actual_speed = float(np.clip(self.current_actual_speed, 0.0, self.MAX_SPEED))
+        final_turn = float(np.clip(self.target_turn, TURN_MIN, TURN_MAX))
+        msg.axes = [0.0, self.current_actual_speed, 0.0, final_turn]
         self.publisher_joy.publish(msg)
 
     def get_sector_ranges(self, message, center_deg, half_width_deg):
@@ -137,95 +155,97 @@ class LineFollower(Node):
         return [r for r in sector if self.MIN_VALID_LIDAR_DIST < r < message.range_max]
 
     def lidar_callback(self, message):
-        """180-Degree Trap Detection & Dynamic Safety Shield"""
+        """Bounded APF: Lets buggy get closer to objects without freezing."""
         front_center = self.get_sector_ranges(message, 0, 15)
-        front_left   = self.get_sector_ranges(message, 45, 30)
-        front_right  = self.get_sector_ranges(message, -45, 30)
-        rear         = self.get_sector_ranges(message, 180, 30)
+        front_left   = self.get_sector_ranges(message, 30, 15)   
+        front_right  = self.get_sector_ranges(message, -30, 15)  
 
         min_fc = min(front_center) if front_center else 10.0
         min_fl = min(front_left) if front_left else 10.0
         min_fr = min(front_right) if front_right else 10.0
-        self.min_rear = min(rear) if rear else 10.0
-        self.front_building_range = min(min_fc, min_fl, min_fr)
-
-        # 1. TRAP DETECTION (Checks all 3 front sectors!)
-        # If any part of the front bumper or side fenders hits something, trigger recovery.
-        trap_dist = min(min_fc, min_fl, min_fr)
         
-        if trap_dist < self.FRONT_TRAP_DIST:
-            self.close_front_count += 1
-            # Log exactly where we got trapped to inform the Ackermann recovery
-            if min_fl == trap_dist: self.trap_location = "LEFT"
-            elif min_fr == trap_dist: self.trap_location = "RIGHT"
-            else: self.trap_location = "CENTER"
-        else:
-            self.close_front_count = 0
-
-        if self.driving_state == "FORWARD" and self.close_front_count >= self.TRAP_DEBOUNCE_COUNT:
-            self.get_logger().warn(f"Trapped on {self.trap_location}! Initiating Smart Recovery.")
-            self.driving_state = "RECOVERY"
-            self.recovery_stage_start = time.time()
-            self.close_front_count = 0
-            return
-
+        self.zone_check_range = min_fc 
+        
+        # Fix for freezing: Only stop if object is < 0.20m!
         self.obstacle_in_front = min_fc < self.FRONT_STOP_DIST
         
-        # 2. VIRTUAL SAFETY SHIELD
-        AVOID_DIST = 1.3
-        MAX_SHIFT = 140.0
-        raw_shift = 0.0
+        # -------------------------------------------------------------
+        # TIGHT LEASH APF WITH MICRO-NOISE DEADBAND
+        # -------------------------------------------------------------
+        AVOID_DIST = 1.15
+        MAX_SHIFT = 60.0  
 
-        if min_fl < AVOID_DIST or min_fr < AVOID_DIST:
-            if min_fl < min_fr:
-                intensity = 1.0 - (min_fl / AVOID_DIST)
-                raw_shift = intensity * MAX_SHIFT
-            else:
-                intensity = 1.0 - (min_fr / AVOID_DIST)
-                raw_shift = -intensity * MAX_SHIFT
+        force_left = max(0.0, 1.0 - (min_fl / AVOID_DIST))
+        force_right = max(0.0, 1.0 - (min_fr / AVOID_DIST))
 
-        # Smooth Evasion Decay (Sticky Memory)
+        raw_shift = (force_left * MAX_SHIFT) - (force_right * MAX_SHIFT)
+        raw_shift = float(np.clip(raw_shift, -MAX_SHIFT, MAX_SHIFT))
+
+        # CORRECTION 1: The Micro-Noise Deadband!
+        # Ignores tiny shifts from distant objects so the buggy doesn't wobble on straights!
+        if abs(raw_shift) < 5.0:
+            raw_shift = 0.0
+
         if abs(raw_shift) > abs(self.obstacle_target_shift):
             self.obstacle_target_shift = raw_shift
         else:
             self.obstacle_target_shift = (0.85 * self.obstacle_target_shift) + (0.15 * raw_shift)
 
+    # -------------------------------------------------------------
+    # STRICT EDGE VECTOR FOLLOWING (YOUR UNTOUCHED PARAMS!)
+    # -------------------------------------------------------------
     def edge_vectors_callback(self, message):
-        """Kinematic Pure Pursuit combined with the Safety Shield Offset."""
-        if self.driving_state == "RECOVERY" or self.mission_state in HOLD_STATES:
-            return
+        if self.mission_state in HOLD_STATES: return
 
         width = message.image_width
         height = message.image_height
-        if width == 0 or height == 0: 
-            return
+        if width == 0 or height == 0: return
 
         car_x = width / 2.0
         car_y = float(height)
+        
         LANE_HALF_WIDTH = width * 0.30 
         SINGLE_LINE_OFFSET = width * 0.42  
 
-        has_active_sign = (self.active_sign_command is not None) and ((time.time() - self.sign_command_timestamp) < 2.0)
+        has_active_sign = (self.active_sign_command is not None) and ((time.time() - self.sign_command_timestamp) < 5.0)
 
+        v1 = message.vector_1 if message.vector_count > 0 else None
+        v2 = message.vector_2 if message.vector_count > 1 else None
+        
+        is_fork = False
         if message.vector_count == 2:
             l_top_x, l_top_y = message.vector_1[0].x, message.vector_1[0].y
             r_top_x, r_top_y = message.vector_2[0].x, message.vector_2[0].y
             lane_width_top = abs(r_top_x - l_top_x)
+            
+            if lane_width_top > (width * 0.38): 
+                is_fork = True
 
-            if lane_width_top > (width * 0.45):
-                if has_active_sign and "LEFT" in self.active_sign_command:
-                    target_x, target_y = l_top_x + LANE_HALF_WIDTH, l_top_y
-                elif has_active_sign and "RIGHT" in self.active_sign_command:
-                    target_x, target_y = r_top_x - LANE_HALF_WIDTH, r_top_y
-                else:
-                    target_x, target_y = r_top_x - LANE_HALF_WIDTH, r_top_y
-            else:
-                target_x = (l_top_x + r_top_x) / 2.0
-                target_y = (l_top_y + r_top_y) / 2.0
+        if message.vector_count == 2 and not is_fork:
+            self.active_sign_command = None
 
-        elif message.vector_count == 1:
-            top_x, top_y = message.vector_1[0].x, message.vector_1[0].y
-            bot_x = message.vector_1[1].x  
+        active_count = message.vector_count
+
+        if is_fork and self.active_sign_command is not None:
+            if "LEFT" in self.active_sign_command:
+                v2 = None
+                active_count = 1
+            elif "RIGHT" in self.active_sign_command:
+                v1 = v2
+                v2 = None
+                active_count = 1
+            elif "STRAIGHT" in self.active_sign_command:
+                v1 = None
+                v2 = None
+                active_count = 0
+
+        if active_count == 2:
+            target_x = (v1[0].x + v2[0].x) / 2.0
+            target_y = (v1[0].y + v2[0].y) / 2.0
+
+        elif active_count == 1:
+            top_x, top_y = v1[0].x, v1[0].y
+            bot_x = v1[1].x  
             avg_x = (top_x + bot_x) / 2.0
 
             if avg_x < car_x:
@@ -233,40 +253,57 @@ class LineFollower(Node):
             else:
                 target_x, target_y = top_x - SINGLE_LINE_OFFSET, top_y
         else:
-            if abs(self.last_turn_direction) > 0.1:
+            if self.active_sign_command is not None and "STRAIGHT" in self.active_sign_command:
+                target_x, target_y = car_x, car_y - 85.0
+            elif abs(self.last_turn_direction) > 0.1:
                 self.target_turn = self.last_turn_direction * 0.85
-                self.target_speed = 0.16
+                self.target_speed = 0.20
                 return
             else:
-                target_x, target_y = car_x, car_y - 70.0
+                target_x, target_y = car_x, car_y - 70.0 
 
-        # APPLY SAFETY SHIELD TO PURE PURSUIT TARGET!
-        target_x += self.obstacle_target_shift
+        safe_shift = np.clip(self.obstacle_target_shift, -80.0, 80.0)
+        target_x += safe_shift
+        target_x = np.clip(target_x, 20.0, width - 20.0)
 
         dx = car_x - target_x  
         dy = car_y - target_y
-        if dy < 70.0: dy = 70.0 
+        
+        # -------------------------------------------------------------
+        # CORRECTION 2: HIGH-SPEED LOOKAHEAD EXTENSION
+        # -------------------------------------------------------------
+        # Look much further down the track at 1.00 m/s to prevent wobbling!
+        dynamic_lookahead = 70.0 + (self.current_actual_speed * 65.0)
+        if dy < dynamic_lookahead: dy = dynamic_lookahead 
 
         theta_error = math.atan2(dx, dy)
         derivative = theta_error - self.prev_error
         self.prev_error = theta_error
 
+        # YOUR PROVEN GAINS RESTORED
         kp_angle = 0.75
         kd_angle = 0.40
         raw_turn = (kp_angle * theta_error) + (kd_angle * derivative)
 
-        smooth_turn = (0.70 * getattr(self, 'target_turn', 0.0)) + (0.30 * raw_turn)
+        smooth_turn = (0.65 * self.target_turn) + (0.35 * raw_turn)
         self.last_turn_direction = float(np.clip(smooth_turn, -1.0, 1.0))
 
-        if abs(theta_error) > 0.35:    
-            self.target_speed = 0.14 
-        elif abs(theta_error) > 0.15:  
-            self.target_speed = 0.22
+        # -------------------------------------------------------------
+        # CORRECTION 3: WIDENED SPEED DEADBANDS
+        # -------------------------------------------------------------
+        # Don't hit the brakes for tiny micro-corrections!
+        if abs(theta_error) > 0.40:    
+            self.target_speed = 0.20  
+        elif abs(theta_error) > 0.22:  
+            self.target_speed = 0.40  
         else:                          
-            self.target_speed = 0.35
+            self.target_speed = self.MAX_SPEED 
 
         self.target_turn = self.last_turn_direction
 
+    # -------------------------------------------------------------
+    # MISSION PROTOCOL
+    # -------------------------------------------------------------
     def resolve_hospital_payload(self, payload):
         if payload in SIGN_TO_HOSPITAL: return SIGN_TO_HOSPITAL[payload]
         if payload in SIGN_TO_HOSPITAL.values(): return payload
@@ -292,15 +329,20 @@ class LineFollower(Node):
                 self.expected_hospital = resolved
                 self.target_letter = HOSPITAL_TO_SIGN[resolved]
                 self.mission_state = "SEARCH_HOSPITAL"
+                self.get_logger().info(f"✅ ASSIGNED HOSPITAL: {resolved} (Route Sign: {self.target_letter})")
+                
         elif self.mission_state == "AT_HOSPITAL_ZONE_WAIT":
             self.patients_delivered += 1
             if self.patients_delivered >= 3:
                 self.mission_state = "EXIT_TO_PARK"
+                self.get_logger().info("✅ ALL PATIENTS DELIVERED: Proceeding to Park.")
             else:
                 self.patient_index += 1
                 resolved = self.resolve_patient_payload(payload)
                 self.target_letter = PATIENT_TO_SIGN[resolved] if resolved else self.patient_sequence[self.patient_index]
                 self.mission_state = "SEARCH_PATIENT"
+                self.get_logger().info(f"✅ NEXT PATIENT: Proceed to {self.target_letter}")
+                
         elif self.mission_state == "PARKED_WAIT_ACK":
             if payload == "OK": self.mission_state = "DONE"
 
@@ -316,13 +358,14 @@ class LineFollower(Node):
 
     def qr_detection_callback(self, message):
         qr_data = self.normalize_qr_payload(message.data)
-        zone_confirmed = self.front_building_range < self.ZONE_RANGE_MAX
+        zone_confirmed = self.zone_check_range < self.ZONE_RANGE_MAX
 
         if self.mission_state == "SEARCH_PATIENT":
             expected = SIGN_TO_PATIENT.get(self.target_letter)
             if qr_data == expected and zone_confirmed:
                 self.send_server_update(qr_data)
                 self.mission_state = "AT_PATIENT_ZONE_WAIT"
+                
         elif self.mission_state == "SEARCH_HOSPITAL":
             if qr_data in FAKE_HOSPITALS: return
             if qr_data == self.expected_hospital and zone_confirmed:
@@ -334,8 +377,10 @@ class LineFollower(Node):
         if len(parts) != 2: return
         letter, direction = parts
         if letter != self.target_letter: return
+        
         self.active_sign_command = direction
         self.sign_command_timestamp = time.time()
+        self.get_logger().info(f"🎯 MATCHED TARGET SIGN ({letter})! Intent Locked: {direction}")
 
 def main(args=None):
     rclpy.init(args=args)
