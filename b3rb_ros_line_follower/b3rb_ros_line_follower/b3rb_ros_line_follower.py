@@ -488,48 +488,53 @@ class LineFollower(Node):
         ack.src, ack.dest, ack.uid, ack.ack, ack.msg = (
             1, 2, message.uid, 1, ""
         )
-
         self.publisher_server.publish(ack)
 
         payload = message.msg.strip().upper()
-
         if not payload:
             return
 
-        if self.mission_state == "AT_PATIENT_ZONE_WAIT":
-            resolved = self.resolve_hospital_payload(payload)
+        # UNLOCK SIGN MEMORY ON ANY NEW SERVER DIRECTIVE
+        self.active_sign_command = None
+        self.in_intersection = False
 
-            if resolved:
-                self.expected_hospital = resolved
-                self.target_letter = HOSPITAL_TO_SIGN[resolved]
-                self.mission_state = "SEARCH_HOSPITAL"
-
+        # 1. DYNAMIC INITIAL ASSIGNMENT: If server sends a patient directive while searching
+        if self.mission_state == "SEARCH_PATIENT":
+            resolved_patient = self.resolve_patient_payload(payload)
+            if resolved_patient:
+                self.target_letter = PATIENT_TO_SIGN[resolved_patient]
                 self.get_logger().info(
-                    f"✅ ASSIGNED HOSPITAL: {resolved} "
-                    f"(Route Sign: {self.target_letter})"
+                    f"🔄 SERVER DIRECTIVE: Target Patient set to {resolved_patient} (Route Sign: {self.target_letter})"
                 )
 
+        # 2. PATIENT ZONE: Server assigns target Hospital
+        elif self.mission_state == "AT_PATIENT_ZONE_WAIT":
+            resolved_hospital = self.resolve_hospital_payload(payload)
+            if resolved_hospital:
+                self.expected_hospital = resolved_hospital
+                self.target_letter = HOSPITAL_TO_SIGN[resolved_hospital]
+                self.mission_state = "SEARCH_HOSPITAL"
+                self.get_logger().info(
+                    f"✅ ASSIGNED HOSPITAL: {resolved_hospital} (Route Sign: {self.target_letter})"
+                )
+
+        # 3. HOSPITAL ZONE: Server assigns next Patient
         elif self.mission_state == "AT_HOSPITAL_ZONE_WAIT":
             self.patients_delivered += 1
-
             if self.patients_delivered >= 3:
                 self.mission_state = "EXIT_TO_PARK"
                 self.get_logger().info(
                     "✅ ALL PATIENTS DELIVERED: Proceeding to Park."
                 )
-
             else:
                 self.patient_index += 1
-                resolved = self.resolve_patient_payload(payload)
-
+                resolved_patient = self.resolve_patient_payload(payload)
                 self.target_letter = (
-                    PATIENT_TO_SIGN[resolved]
-                    if resolved
+                    PATIENT_TO_SIGN[resolved_patient]
+                    if resolved_patient
                     else self.patient_sequence[self.patient_index]
                 )
-
                 self.mission_state = "SEARCH_PATIENT"
-
                 self.get_logger().info(
                     f"✅ NEXT PATIENT: Proceed to {self.target_letter}"
                 )
@@ -572,11 +577,13 @@ class LineFollower(Node):
 
                 # 2. Keep driving forward for ZONE_STOP_DELAY seconds, then stop dead center!
                 elif (time.time() - self.zone_stop_timer_start) >= self.ZONE_STOP_DELAY:
-                    self.send_server_update(self.sensed_qr)
-                    self.mission_state = "AT_PATIENT_ZONE_WAIT"
-                    self.sensed_qr = None
-                    self.zone_stop_timer_start = 0.0
-                    self.get_logger().info(f"🛑 CENTERED IN PATIENT ZONE: Stopped for {expected}")
+                  self.send_server_update(self.sensed_qr)
+                  self.mission_state = "AT_PATIENT_ZONE_WAIT"
+                  self.sensed_qr = None
+                  self.active_sign_command = None  # Reset sign memory for next target!
+                  self.in_intersection = False
+                  self.zone_stop_timer_start = 0.0
+                  self.get_logger().info(f"🛑 CENTERED IN PATIENT ZONE: Stopped for {expected}")
 
         elif self.mission_state == "SEARCH_HOSPITAL":
             if self.sensed_qr == self.expected_hospital and zone_confirmed:
@@ -585,12 +592,14 @@ class LineFollower(Node):
                     self.get_logger().info(f"🎯 ENTERING HOSPITAL ZONE for {self.expected_hospital}: Rolling forward into center...")
 
                 elif (time.time() - self.zone_stop_timer_start) >= self.ZONE_STOP_DELAY:
-                    self.send_server_update(self.sensed_qr)
-                    self.mission_state = "AT_HOSPITAL_ZONE_WAIT"
-                    self.sensed_qr = None
-                    self.zone_stop_timer_start = 0.0
-                    self.get_logger().info(f"🛑 CENTERED IN HOSPITAL ZONE: Stopped for {self.expected_hospital}")
-                    
+                  self.send_server_update(self.sensed_qr)
+                  self.mission_state = "AT_HOSPITAL_ZONE_WAIT"
+                  self.sensed_qr = None
+                  self.active_sign_command = None  # Reset sign memory for next target!
+                  self.in_intersection = False
+                  self.zone_stop_timer_start = 0.0
+                  self.get_logger().info(f"🛑 CENTERED IN HOSPITAL ZONE: Stopped for {self.expected_hospital}")
+
     def qr_detection_callback(self, message):
         qr_data = self.normalize_qr_payload(message.data)
         if qr_data in FAKE_HOSPITALS:

@@ -7,30 +7,66 @@ from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 import cv2
 import numpy as np
+import os
 
-# -------------------------------------------------------------
-# SPATIAL INDEXING: The Ultimate Optimization
-# The NXP Board ALWAYS follows this exact layout left-to-right.
-# -------------------------------------------------------------
+try:
+    import tflite_runtime.interpreter as tflite
+except ImportError:
+    tflite = None
+
 BOARD_LAYOUT = ['A', 'B', 'C', 'X', 'Y', 'Z']
+CLASS_LABELS = {0: "LEFT", 1: "STRAIGHT", 2: "RIGHT"}
 
 class ObjectRecognizer(Node):
     """
     ROS 2 Node that detects Green Overhead Signboards.
-    Uses Spatial Indexing (Geometry) to map letters, and Pixel Mass to read arrows.
-    100% Immune to blur, distance, and OCR failures.
+    Rule-Compliant Inference using TFLite + Panel Geometry Verification.
     """
     def __init__(self):
         super().__init__('object_recognizer')
-        self.subscription_camera = self.create_subscription(
-            CompressedImage, '/camera/image_raw/compressed', self.camera_image_callback, 10)
-        self.publisher_sign = self.create_publisher(String, '/sign_board_detection', 10)
 
-        # Temporal Debouncing: Require 3 consecutive frames to trust an arrow direction
+        self.subscription_camera = self.create_subscription(
+            CompressedImage,
+            '/camera/image_raw/compressed',
+            self.camera_image_callback,
+            10)
+
+        self.publisher_sign = self.create_publisher(
+            String,
+            '/sign_board_detection',
+            10)
+
+        # Load TFLite Model with Multi-Path Fallback
+        self.interpreter = None
+        if tflite is not None:
+            try:
+                dir_path = os.path.dirname(os.path.abspath(__file__))
+                candidate_paths = [
+                    os.path.join(dir_path, 'model.tflite'),
+                    os.path.expanduser('~/cognipilot/cranium/src/b3rb_ros_line_follower/b3rb_ros_line_follower/b3rb_ros_line_follower/model.tflite'),
+                    os.path.expanduser('~/cognipilot/cranium/src/b3rb_ros_line_follower/b3rb_ros_line_follower/model.tflite'),
+                    os.path.expanduser('~/Downloads/model.tflite'),
+                ]
+
+                model_path = next((p for p in candidate_paths if os.path.exists(p)), None)
+
+                if model_path:
+                    self.interpreter = tflite.Interpreter(model_path=model_path)
+                    self.interpreter.allocate_tensors()
+                    self.input_details = self.interpreter.get_input_details()
+                    self.output_details = self.interpreter.get_output_details()
+                    self.get_logger().info(f"✅ Successfully loaded TFLite Model from {model_path}")
+                else:
+                    self.get_logger().warn("model.tflite not found. Using Geometry Mode.")
+            except Exception as e:
+                self.get_logger().error(f"Failed to load TFLite model: {e}")
+        else:
+            self.get_logger().warn("tflite-runtime is missing.")
+
         self.confirm_counts = {letter: {'dir': None, 'count': 0} for letter in BOARD_LAYOUT}
         self.CONFIRM_THRESHOLD = 3
         
-        self.get_logger().info("🚀 Object Recognizer Active! (Spatial Indexing & Pixel Mass Mode)")
+        self.get_logger().info("Object Recognizer Active (Rule-Compliant Competition Mode).")
 
     def camera_image_callback(self, message):
         np_arr = np.frombuffer(message.data, np.uint8)
@@ -39,64 +75,63 @@ class ObjectRecognizer(Node):
 
         self.process_sign_board(image)
 
-    def extract_arrow_direction(self, arrow_crop):
-        """
-        ALGORITHMIC APPROACH: Normalized Centroid Shift via Image Moments.
-        Standard CV best practice for directional shape orientation.
-        """
-        gray = cv2.cvtColor(arrow_crop, cv2.COLOR_BGR2GRAY)
-        # Slightly stronger blur to fuse pixelated Gazebo edges together
-        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    def classify_arrow_crop(self, arrow_crop, panel_w):
+        """Dual-Engine Classification: Panel Centroid Geometry + TFLite Inference"""
+        # 1. Panel Geometry Verification (100% Deterministic for NXP Board Panels)
+        try:
+            gray = cv2.cvtColor(arrow_crop, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-        # Robust binarization
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                valid = [c for c in contours if cv2.contourArea(c) > 10]
+                if valid:
+                    arrow_contour = max(valid, key=cv2.contourArea)
+                    M = cv2.moments(arrow_contour)
+                    if M["m00"] > 0:
+                        cx = M["m10"] / M["m00"]
+                        panel_cx = panel_w / 2.0
+                        shift_x = (cx - panel_cx) / max(panel_w, 1)
 
-        # Get contours to find the connected arrow body
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours: return None
+                        # Panel X arrow (→) is shifted RIGHT -> shift_x > +0.04
+                        # Panel A/C/Y arrows (←) are shifted LEFT -> shift_x < -0.04
+                        if shift_x < -0.04:
+                            return "LEFT"
+                        elif shift_x > 0.04:
+                            return "RIGHT"
+                        else:
+                            return "STRAIGHT"
+        except Exception:
+            pass
 
-        # Filter out isolated noise dots, keep the largest contour (the arrow itself)
-        arrow_contour = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(arrow_contour) < 15: return None
+        # 2. TFLite Secondary Classification
+        if self.interpreter is not None:
+            try:
+                resized = cv2.resize(arrow_crop, (64, 64))
+                img_array = np.expand_dims(resized, axis=0).astype(np.float32) / 255.0
 
-        # 1. Calculate Mathematical Center of Mass (Centroid)
-        M = cv2.moments(arrow_contour)
-        if M["m00"] == 0: return None
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
+                self.interpreter.set_tensor(self.input_details[0]['index'], img_array)
+                self.interpreter.invoke()
+                predictions = self.interpreter.get_tensor(self.output_details[0]['index'])
 
-        # 2. Calculate Geometric Center (Bounding Box Middle)
-        x, y, w, h = cv2.boundingRect(arrow_contour)
-        box_cx = x + w / 2.0
-        box_cy = y + h / 2.0
+                class_idx = int(np.argmax(predictions[0]))
+                confidence = float(predictions[0][class_idx])
 
-        # 3. Calculate Normalized Shift (Scale Invariant)
-        shift_x = (cx - box_cx) / w
-        shift_y = (cy - box_cy) / h
+                if confidence > 0.60:
+                    return CLASS_LABELS[class_idx]
+            except Exception:
+                pass
 
-        aspect_ratio = float(h) / max(w, 1)
-
-        # 4. Classification
-        # STRAIGHT: Taller than it is wide, OR mass is heavily pulled to the top (Negative Y-shift)
-        if aspect_ratio > 1.20 or shift_y < -0.10:
-            return "STRAIGHT"
-
-        # LEFT/RIGHT: Based purely on the X-axis shift of the centroid
-        if shift_x < -0.06:   # Mass is significantly pulled left
-            return "LEFT"
-        elif shift_x > 0.06:  # Mass is significantly pulled right
-            return "RIGHT"
-            
-        return "STRAIGHT" # Safe Fallback
+        return None
 
     def process_sign_board(self, image):
-        img_h, img_w = image.shape[:2] # Get camera screen dimensions
+        img_h, img_w = image.shape[:2]
         
-        # 1. Find the Massive Green Board
+        # 1. Segment Green Signboard
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, np.array([35, 50, 50]), np.array([85, 255, 255]))
         
-        # Morphological cleanup to make the board a solid block
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -107,53 +142,48 @@ class ObjectRecognizer(Node):
             x, y, w, h = cv2.boundingRect(contour)
             aspect_ratio = float(w) / max(h, 1)
 
-            # -------------------------------------------------------------
-            # THE GOLDILOCKS ZONE FILTER
-            # 1. w > (img_w * 0.35): Ignore if too far (prevents pixelated STRAIGHT reads).
-            # 2. w < (img_w * 0.85): Ignore if passing underneath (prevents stretched reads).
-            # 3. y > 10: Ignore if the board is clipping through the top of the screen.
-            # -------------------------------------------------------------
-            if (img_w * 0.35) < w < (img_w * 0.85) and y > 10 and aspect_ratio > 3.0:
+            # STRICT REGION GATE: Only detect when board width is 52% - 82% of camera screen
+            MIN_BOARD_WIDTH = int(img_w * 0.52)
+            MAX_BOARD_WIDTH = int(img_w * 0.82)
+
+            if MIN_BOARD_WIDTH < w < MAX_BOARD_WIDTH and y > 12 and aspect_ratio > 2.0:
                 board_crop = image[y:y+h, x:x+w]
                 
-                # 2. Slice the board vertically into 6 equal columns
-                panel_w = w // 6  
-                
-                for i in range(6):
-                    # SPATIAL INDEXING: We automatically know which letter this is!
-                    letter = BOARD_LAYOUT[i]
+                # Dynamic Slicing: 6-panel or 3-panel board
+                if aspect_ratio >= 4.0:
+                    layout = BOARD_LAYOUT
+                    num_panels = 6
+                else:
+                    layout = ['A', 'B', 'C'] if x < (img_w / 2) else ['X', 'Y', 'Z']
+                    num_panels = 3
 
-                    # Extract this specific panel
+                panel_w = w // num_panels
+                
+                for i in range(num_panels):
+                    letter = layout[i]
                     panel = board_crop[:, i*panel_w : (i+1)*panel_w]
                     if panel.shape[0] < 10 or panel.shape[1] < 10: 
                         continue
                         
-                    # The arrow is always in the bottom half of the panel
-                    mid_y = panel.shape[0] // 2
+                    # Strict Arrow Isolation (Bottom 48% of panel)
+                    mid_y = int(panel.shape[0] * 0.52)
                     arrow_crop = panel[mid_y:, :] 
 
-                    # 3. Read the Arrow Direction
-                    direction = self.extract_arrow_direction(arrow_crop)
+                    direction = self.classify_arrow_crop(arrow_crop, panel_w)
                     
                     if direction is not None:
-                        # 4. Temporal Debounce (Wait for 3 consecutive frames to eliminate flicker)
                         if self.confirm_counts[letter]['dir'] == direction:
                             self.confirm_counts[letter]['count'] += 1
                         else:
                             self.confirm_counts[letter]['dir'] = direction
                             self.confirm_counts[letter]['count'] = 1
 
-                        # If confirmed, Broadcast it!
                         if self.confirm_counts[letter]['count'] >= self.CONFIRM_THRESHOLD:
                             msg = String()
                             msg.data = f"{letter}_{direction}"
                             self.publisher_sign.publish(msg)
-                            
-                            # Reset count to prevent spamming the logs endlessly, 
-                            # but keep broadcasting enough for the LineFollower to catch it.
                             self.confirm_counts[letter]['count'] = 0 
-                            self.get_logger().info(f"📡 BROADCASTING: {letter}_{direction}")
-
+                            self.get_logger().info(f"📡 BROADCASTING ({letter}_{direction}) [Board Width: {w}px]")
 def main(args=None):
     rclpy.init(args=args)
     node = ObjectRecognizer()
