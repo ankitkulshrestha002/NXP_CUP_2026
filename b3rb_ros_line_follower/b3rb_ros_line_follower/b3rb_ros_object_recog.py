@@ -151,7 +151,7 @@ class ObjectRecognizer(Node):
         # Combine both red/orange hue ranges
         mask1 = cv2.inRange(hsv, CONE_RED_LOW_1, CONE_RED_HIGH_1)
         mask2 = cv2.inRange(hsv, CONE_RED_LOW_2, CONE_RED_HIGH_2)
-        masak = cv2.bitwise_or(mask1, mask2)
+        mask = cv2.bitwise_or(mask1, mask2)  # <--- FIXED TYPO HERE
 
         # Only look at bottom 75% of frame (cones are ground-level)
         top_cutoff = int(img_h * 0.25)
@@ -205,7 +205,7 @@ class ObjectRecognizer(Node):
             self.get_logger().info(
                 f"🔶 CONES: {position} ({len(cone_contours)} cones, avg_x={avg_x:.0f}/{img_w})"
             )
-
+            
     def process_sign_board(self, image):
         """
         Uses YOLO to detect both letters and arrows simultaneously and returns a dictionary.
