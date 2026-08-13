@@ -176,12 +176,11 @@ class LineFollower(Node):
 
             elif self.parking_phase == 1:
                 # Phase 1: Drive forward past the cones to align the rear
-                self.current_actual_speed = 0.60   # Slightly faster to cover the distance
+                self.current_actual_speed = 0.40   
                 self.target_turn = 0.0
                 
-                # Driven forward for 3.5 seconds. 
-                # -> IF IT STILL CLIPS THE FRONT CONE, increase this to 4.0!
-                if elapsed > 3.5:  
+                # INCREASED to 3.2s so it pulls MUCH further forward and clears that entry cone!
+                if elapsed > 3.2:  
                     self.parking_phase = 2
                     self.parking_timer_start = time.time()
                     self.get_logger().info(f"🅿️ Swinging reverse into {self.parking_cone_side}.")
@@ -189,11 +188,12 @@ class LineFollower(Node):
             elif self.parking_phase == 2:
                 # Phase 2: Swing in reverse
                 self.current_actual_speed = -0.40  
+                
+                # SHARPER TURN: Increased to 1.0 (max lock) to pivot beautifully into the slot
                 self.target_turn = 1.0 if self.parking_cone_side == "LEFT" else -1.0
                 
-                # FIXED: Removed the LiDAR abort here! The buggy MUST finish the full 
-                # 2.5 second swing arc without panicking about side cones.
-                if elapsed > 2.5:  
+                # Swing for longer (2.8s) to ensure it gets fully inside the box before straightening
+                if elapsed > 2.8 or self.min_rear < 0.35:  
                     self.parking_phase = 3
                     self.parking_timer_start = time.time()
                     self.get_logger().info("🅿️ Straightening out...")
@@ -203,8 +203,8 @@ class LineFollower(Node):
                 self.current_actual_speed = -0.40  
                 self.target_turn = 0.0
                 
-                # SMART STOPPING: Now it relies on the narrow rear LiDAR to stop exactly 0.45m from the back!
-                if elapsed > 3.0 or self.min_rear < 0.45:  
+                # SMART STOPPING: Stops exactly when the wide rear LiDAR hits 0.40m from the back cones!
+                if elapsed > 3.0 or self.min_rear < 0.40:  
                     self.parking_phase = 4
                     self.get_logger().info(f"🅿️ Successfully Parked! (Rear Dist: {self.min_rear:.2f}m)")
 
@@ -356,7 +356,7 @@ class LineFollower(Node):
 
         # 1. 10-SECOND AUTOMATIC TURN TIMEOUT
         if self.active_sign_command is not None and getattr(self, 'sign_command_timestamp', 0.0) > 0.0:
-            if (time.time() - self.sign_command_timestamp) > 14.0:
+            if (time.time() - self.sign_command_timestamp) > 12.0:
                 self.active_sign_command = None
                 self.in_intersection = False
                 self.last_received_sign = None
@@ -457,6 +457,7 @@ class LineFollower(Node):
                 active_count = 1
 
         # TARGET CALCULATION
+        # TARGET CALCULATION
         if active_count == 2:
             target_x = (v1[0].x + v2[0].x) / 2.0
             target_y = (v1[0].y + v2[0].y) / 2.0
@@ -472,14 +473,6 @@ class LineFollower(Node):
                 else:   
                     target_x, target_y = car_x - 120.0, car_y - 70.0
 
-            elif self.active_sign_command == "STRAIGHT" and self.straight_phase == "FOLLOW_LEFT":
-                # Smaller offset (0.15) — gentle drift left, not a full turn
-                STRAIGHT_OFFSET = width * 0.15
-                if avg_x < car_x + 50:
-                    target_x, target_y = top_x + STRAIGHT_OFFSET, top_y
-                else:
-                    target_x, target_y = car_x - 60.0, car_y - 70.0
-
             elif self.active_sign_command == "RIGHT":
                 if avg_x > car_x - 50:
                     target_x, target_y = top_x - SINGLE_LINE_OFFSET, top_y
@@ -487,14 +480,15 @@ class LineFollower(Node):
                     target_x, target_y = car_x + 120.0, car_y - 70.0
 
             else:
+                # FIX: Handles both "STRAIGHT" and "None" commands safely with standard lane offset
                 if avg_x < car_x:
                     target_x, target_y = top_x + SINGLE_LINE_OFFSET, top_y
                 else:
                     target_x, target_y = top_x - SINGLE_LINE_OFFSET, top_y
 
         else:
-            if self.active_sign_command == "STRAIGHT" and self.straight_phase in ("WAITING_ZERO", "FOLLOW_LEFT"):
-                # Hold straight ahead during blind crossing
+            if self.active_sign_command == "STRAIGHT":
+                # FIX: ALWAYS hold dead straight ahead during the blind gap crossing!
                 target_x, target_y = car_x, car_y - 70.0
             elif self.active_sign_command == "LEFT":
                 target_x, target_y = car_x - 120.0, car_y - 70.0
@@ -674,7 +668,7 @@ class LineFollower(Node):
                     self.get_logger().info(f"🛑 CENTERED IN HOSPITAL ZONE: Stopped for {self.expected_hospital}")
 
                     self.patients_delivered += 1
-                    if self.patients_delivered >= 1:
+                    if self.patients_delivered >= 3:
                         # 3rd delivery done — go straight to parking, don't wait for server
                         self.set_mission_state("EXIT_TO_PARK")
                         self.parking_phase = 0
