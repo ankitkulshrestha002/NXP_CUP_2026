@@ -131,7 +131,7 @@ class LineFollower(Node):
         self.sensed_qr = None
         self.zone_stop_timer_start = 0.0
         
-        self.ZONE_STOP_DELAY = 0.5    
+        self.ZONE_STOP_DELAY = 2.3
         
         self.front_building_range = 10.0
         self.obstacle_in_front = False
