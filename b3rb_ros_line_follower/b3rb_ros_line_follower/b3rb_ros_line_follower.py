@@ -8,6 +8,7 @@ import math
 import re
 import numpy as np
 from sensor_msgs.msg import Joy, LaserScan
+from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 from synapse_msgs.msg import EdgeVectors, ServerCommunication
 
@@ -58,12 +59,27 @@ class LineFollower(Node):
             self.sign_board_callback,
             QOS_PROFILE_DEFAULT
         )
+        self.create_subscription(
+            String,
+            '/cone_detection_cam',
+            self.cone_detection_callback,
+            QOS_PROFILE_DEFAULT
+        )
+        self.create_subscription(
+            Odometry,
+            '/cerebri/out/odometry',
+            self.odometry_callback,
+            QOS_PROFILE_DEFAULT
+        )
 
         self.publisher_joy = self.create_publisher(
             Joy, '/cerebri/in/joy', QOS_PROFILE_DEFAULT
         )
         self.publisher_server = self.create_publisher(
             ServerCommunication, '/ServerCommunication', QOS_PROFILE_DEFAULT
+        )
+        self.publisher_mission_state = self.create_publisher(
+            String, '/mission_state', QOS_PROFILE_DEFAULT
         )
 
         # Mission State
@@ -76,10 +92,22 @@ class LineFollower(Node):
         self.outbound_uid = 100
         self.parking_timer_start = 0.0
 
-        # Steering, Speed, & Ramping (EXTREME HIGH SPEED SETTINGS)
-        self.MAX_SPEED = 10.0         # Massive straightaway speed!
-        self.MIN_CORNER_SPEED = 1.80  # Much faster cornering
-        self.target_speed = 1.50      
+        # Parking State Machine (Kinematic Reverse Swing)
+        self.parking_phase = 0          # 0: SEARCH, 1: CLEAR, 2: SWING, 3: STRAIGHT, 4: DONE
+        self.parking_cone_side = None    # "LEFT" or "RIGHT"
+        self.parking_start_time = 0.0    # For LIDAR fallback timeout
+        self.parking_timer_start = 0.0   # For swing sequence timing
+
+        # Odometry tracking for distance-based cone suppression
+        self.odom_x = 0.0
+        self.odom_y = 0.0
+        self.parking_start_x = 0.0
+        self.parking_start_y = 0.0
+
+        # Steering, Speed, & Ramping 
+        self.MAX_SPEED = 2.7        
+        self.MIN_CORNER_SPEED = 0.50
+        self.target_speed = 5.00      
         self.current_actual_speed = 0.0
         self.target_turn = 0.0
         self.prev_error = 0.0
@@ -88,13 +116,21 @@ class LineFollower(Node):
         self.active_sign_command = None
         self.sign_command_timestamp = 0.0
 
+        # STRAIGHT phase machine
+        self.straight_phase = None          
+        self.straight_zero_start = 0.0      
+        self.straight_follow_start = 0.0    
+
+        # Sign confirmation
+        self.last_received_sign = None
+        self.sign_confirm_count = 0
+
         # LIDAR Shield & Stopping
         self.MIN_VALID_LIDAR_DIST = 0.30
         self.ZONE_RANGE_MAX = 1.20
         self.sensed_qr = None
         self.zone_stop_timer_start = 0.0
         
-        # Stop Delay for Glide
         self.ZONE_STOP_DELAY = 0.5    
         
         self.front_building_range = 10.0
@@ -114,23 +150,79 @@ class LineFollower(Node):
 
         self.control_timer = self.create_timer(0.1, self.publish_drive_commands)
 
-    def check_if_parked(self):
-        if self.parking_timer_start == 0.0:
-            self.parking_timer_start = time.time()
-            return False
-
-        if (time.time() - self.parking_timer_start) > 12.0:
-            return True
-
-        return False
+    def set_mission_state(self, new_state):
+        self.mission_state = new_state
+        msg = String()
+        msg.data = new_state
+        self.publisher_mission_state.publish(msg)
+        self.get_logger().info(f"📋 Mission state → {new_state}")
 
     def publish_drive_commands(self):
         msg = Joy()
         msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]
 
-        if self.mission_state == "EXIT_TO_PARK" and self.check_if_parked():
-            self.send_server_update("PARKED")
-            self.mission_state = "PARKED_WAIT_ACK"
+        # =========================================================
+        # KINEMATIC REVERSE SWING PARKING LOGIC
+        # =========================================================
+        # =========================================================
+        # KINEMATIC REVERSE SWING PARKING LOGIC (SMOOTH CALIBRATION)
+        # =========================================================
+        if self.mission_state == "EXIT_TO_PARK":
+            elapsed = time.time() - self.parking_timer_start
+
+            if self.parking_phase == 0:
+                # Drive forward slowly, scanning for cones
+                self.target_speed = 0.40 
+
+            elif self.parking_phase == 1:
+                # Phase 1: Drive forward past the cones to align the rear
+                self.current_actual_speed = 0.60   # Slightly faster to cover the distance
+                self.target_turn = 0.0
+                
+                # Driven forward for 3.5 seconds. 
+                # -> IF IT STILL CLIPS THE FRONT CONE, increase this to 4.0!
+                if elapsed > 3.5:  
+                    self.parking_phase = 2
+                    self.parking_timer_start = time.time()
+                    self.get_logger().info(f"🅿️ Swinging reverse into {self.parking_cone_side}.")
+            
+            elif self.parking_phase == 2:
+                # Phase 2: Swing in reverse
+                self.current_actual_speed = -0.40  
+                self.target_turn = 1.0 if self.parking_cone_side == "LEFT" else -1.0
+                
+                # FIXED: Removed the LiDAR abort here! The buggy MUST finish the full 
+                # 2.5 second swing arc without panicking about side cones.
+                if elapsed > 2.5:  
+                    self.parking_phase = 3
+                    self.parking_timer_start = time.time()
+                    self.get_logger().info("🅿️ Straightening out...")
+
+            elif self.parking_phase == 3:
+                # Phase 3: Straight reverse deep into the slot
+                self.current_actual_speed = -0.40  
+                self.target_turn = 0.0
+                
+                # SMART STOPPING: Now it relies on the narrow rear LiDAR to stop exactly 0.45m from the back!
+                if elapsed > 3.0 or self.min_rear < 0.45:  
+                    self.parking_phase = 4
+                    self.get_logger().info(f"🅿️ Successfully Parked! (Rear Dist: {self.min_rear:.2f}m)")
+
+            elif self.parking_phase == 4:
+                # Phase 4: Mission Complete!
+                self.current_actual_speed = 0.0
+                self.target_turn = 0.0
+                self.send_server_update("PARKED")
+                self.set_mission_state("PARKED_WAIT_ACK")
+                return
+
+            # Override lane following while doing the swing/reverse sequence
+            if self.parking_phase in [1, 2, 3]:
+                msg.axes = [0.0, self.current_actual_speed, 0.0, float(self.target_turn)]
+                self.publisher_joy.publish(msg)
+                return
+        # =========================================================
+        # =========================================================
 
         if self.mission_state in HOLD_STATES:
             self.current_actual_speed = 0.0
@@ -157,13 +249,12 @@ class LineFollower(Node):
 
         desired_speed = 0.0 if self.obstacle_in_front else self.target_speed
 
-        # AGGRESSIVE ACCELERATION & BRAKING FOR SPEED 10
         if self.current_actual_speed < desired_speed:
-            self.current_actual_speed += 0.30  # Very fast acceleration
+            self.current_actual_speed += 0.35  # Accelerate slightly faster
             self.current_actual_speed = min(self.current_actual_speed, desired_speed)
         elif self.current_actual_speed > desired_speed:
-            # Massive braking force needed to slow down from 10 m/s
-            brake_force = 1.50 if desired_speed == 0.0 else 0.80
+            # HARDER BRAKING: If we need to stop (0.0), brake much faster!
+            brake_force = 1.80 if desired_speed == 0.0 else 0.80
             self.current_actual_speed -= brake_force
             self.current_actual_speed = max(self.current_actual_speed, desired_speed)
 
@@ -186,13 +277,26 @@ class LineFollower(Node):
         front_center = self.get_sector_ranges(message, 0, 15)
         front_left   = self.get_sector_ranges(message, 25, 15)   
         front_right  = self.get_sector_ranges(message, -25, 15)  
+        
+        # --- NEW: Look backwards to prevent reversing into walls! ---
+        # --- NEW: Look backwards to prevent reversing into walls! ---
+        # WIDENED to 45 degrees (90-degree total cone) to easily spot the parking cones!
+        rear         = self.get_sector_ranges(message, 180, 15)
 
         min_fc = min(front_center) if front_center else 10.0
         min_fl = min(front_left) if front_left else 10.0
         min_fr = min(front_right) if front_right else 10.0
+        
+        # --- NEW: Save rear distance ---
+        self.min_rear = min(rear) if rear else 10.0
 
         self.zone_check_range = min(min_fc, min_fl, min_fr)
-        self.obstacle_in_front = min_fc < self.FRONT_STOP_DIST
+
+        # During parking swing/reverse phase, disable obstacle_in_front so it doesn't trigger front emergency brakes
+        if self.mission_state == "EXIT_TO_PARK" and self.parking_phase > 0:
+            self.obstacle_in_front = False
+        else:
+            self.obstacle_in_front = min_fc < self.FRONT_STOP_DIST
 
         AVOID_DIST = 1.15
         MAX_SHIFT = 60.0
@@ -213,8 +317,32 @@ class LineFollower(Node):
 
         self.check_zone_arrival()
 
+        # LIDAR Fallback: If camera misses the cones, trigger swing sequence anyway based on side distance
+        if self.mission_state == "EXIT_TO_PARK" and self.parking_phase == 0:
+            if self.parking_start_time > 0 and (time.time() - self.parking_start_time) > 7.0:
+                left_fwd  = self.get_sector_ranges(message, 40, 15)
+                right_fwd = self.get_sector_ranges(message, -40, 15)
+                min_lf = min(left_fwd) if left_fwd else 10.0
+                min_rf = min(right_fwd) if right_fwd else 10.0
+
+                if min_lf < 1.5:
+                    self.parking_cone_side = "LEFT"
+                    self.parking_phase = 1
+                    self.parking_timer_start = time.time()
+                    self.get_logger().info("⏱️ LIDAR FALLBACK: Cones detected LEFT. Clearing cones.")
+                elif min_rf < 1.5:
+                    self.parking_cone_side = "RIGHT"
+                    self.parking_phase = 1
+                    self.parking_timer_start = time.time()
+                    self.get_logger().info("⏱️ LIDAR FALLBACK: Cones detected RIGHT. Clearing cones.")
+
+
     def edge_vectors_callback(self, message):
         if self.mission_state in HOLD_STATES:
+            return
+
+        # Skip line-following calculation when we are executing the parking swing sequence
+        if self.mission_state == "EXIT_TO_PARK" and self.parking_phase > 0:
             return
 
         width = message.image_width
@@ -226,13 +354,18 @@ class LineFollower(Node):
         car_x = width / 2.0
         car_y = float(height)
 
-        # 1. TIMEOUT REDUCED TO 5 SECONDS (Was 16s)
+        # 1. 10-SECOND AUTOMATIC TURN TIMEOUT
         if self.active_sign_command is not None and getattr(self, 'sign_command_timestamp', 0.0) > 0.0:
-            if (time.time() - self.sign_command_timestamp) > 5.0:
+            if (time.time() - self.sign_command_timestamp) > 14.0:
                 self.active_sign_command = None
                 self.in_intersection = False
+                self.last_received_sign = None
+                self.sign_confirm_count = 0
                 self.sign_command_timestamp = 0.0
-                self.get_logger().info("⏱️ Turn completed (5s timeout). Memory automatically reset.")
+                self.straight_phase = None
+                self.straight_zero_start = 0.0
+                self.straight_follow_start = 0.0
+                self.get_logger().info("⏱️ Turn completed. Memory automatically reset for next signboard.")
 
         LANE_HALF_WIDTH = width * 0.30
         SINGLE_LINE_OFFSET = width * 0.42
@@ -257,7 +390,12 @@ class LineFollower(Node):
                 if getattr(self, 'in_intersection', False):
                     self.active_sign_command = None
                     self.in_intersection = False
+                    self.last_received_sign = None
+                    self.sign_confirm_count = 0
                     self.sign_command_timestamp = 0.0
+                    self.straight_phase = None
+                    self.straight_zero_start = 0.0
+                    self.straight_follow_start = 0.0
                     self.get_logger().info("🛣️ Lane safely realigned. Memory wiped for next signboard.")
 
         if is_fork and has_active_sign:
@@ -265,11 +403,55 @@ class LineFollower(Node):
 
         active_count = message.vector_count
 
-        if is_fork and has_active_sign:
+        # --- STRAIGHT Phase Machine ---
+        straight_handled = False
+        if self.active_sign_command == "STRAIGHT":
+            if self.straight_phase == "WAITING_ZERO":
+                if message.vector_count == 0:
+                    if self.straight_zero_start == 0.0:
+                        self.straight_zero_start = time.time()
+                    elapsed = time.time() - self.straight_zero_start
+                    if elapsed > 0.1:
+                        # We are fully in the blank space! Start blind crossing.
+                        self.straight_phase = "BLIND_CROSSING"
+                        self.straight_follow_start = time.time()
+                        self.get_logger().info("🔀 STRAIGHT: In blank space. Crossing blindly.")
+                else:
+                    self.straight_zero_start = 0.0
+                straight_handled = True
+
+            elif self.straight_phase == "BLIND_CROSSING":
+                elapsed = time.time() - self.straight_follow_start
+                # Stay blind for 1.2 seconds to fully cross the white space
+                if elapsed > 1.2:
+                    self.straight_phase = "GENTLE_INCLINE"
+                    self.straight_follow_start = time.time()
+                    self.get_logger().info("🔀 STRAIGHT: Cleared gap. Gently inclining to correct path.")
+                else:
+                    # Ignore all lines in the intersection
+                    active_count = 0
+                straight_handled = True
+                
+            elif self.straight_phase == "GENTLE_INCLINE":
+                elapsed = time.time() - self.straight_follow_start
+                # Spend 1.0 second easing into the new lane before returning to full aggressive steering
+                if elapsed > 1.0:
+                    self.active_sign_command = None
+                    self.straight_phase = None
+                    self.in_intersection = False
+                    self.last_received_sign = None
+                    self.sign_confirm_count = 0
+                    self.sign_command_timestamp = 0.0
+                    self.straight_zero_start = 0.0
+                    self.straight_follow_start = 0.0
+                    self.get_logger().info("✅ STRAIGHT: Fully recovered to correct lane.")
+                straight_handled = True
+
+        if not straight_handled and is_fork and has_active_sign:
             if "LEFT" in self.active_sign_command:
                 v2 = None
                 active_count = 1
-            elif "RIGHT" in self.active_sign_command or "STRAIGHT" in self.active_sign_command:
+            elif "RIGHT" in self.active_sign_command:
                 v1 = v2
                 v2 = None
                 active_count = 1
@@ -290,7 +472,15 @@ class LineFollower(Node):
                 else:   
                     target_x, target_y = car_x - 120.0, car_y - 70.0
 
-            elif self.active_sign_command == "RIGHT" or self.active_sign_command == "STRAIGHT":
+            elif self.active_sign_command == "STRAIGHT" and self.straight_phase == "FOLLOW_LEFT":
+                # Smaller offset (0.15) — gentle drift left, not a full turn
+                STRAIGHT_OFFSET = width * 0.15
+                if avg_x < car_x + 50:
+                    target_x, target_y = top_x + STRAIGHT_OFFSET, top_y
+                else:
+                    target_x, target_y = car_x - 60.0, car_y - 70.0
+
+            elif self.active_sign_command == "RIGHT":
                 if avg_x > car_x - 50:
                     target_x, target_y = top_x - SINGLE_LINE_OFFSET, top_y
                 else:
@@ -303,7 +493,10 @@ class LineFollower(Node):
                     target_x, target_y = top_x - SINGLE_LINE_OFFSET, top_y
 
         else:
-            if self.active_sign_command == "LEFT":
+            if self.active_sign_command == "STRAIGHT" and self.straight_phase in ("WAITING_ZERO", "FOLLOW_LEFT"):
+                # Hold straight ahead during blind crossing
+                target_x, target_y = car_x, car_y - 70.0
+            elif self.active_sign_command == "LEFT":
                 target_x, target_y = car_x - 120.0, car_y - 70.0
             else:
                 target_x, target_y = car_x + 120.0, car_y - 70.0
@@ -315,9 +508,7 @@ class LineFollower(Node):
         dx = car_x - target_x
         dy = car_y - target_y
 
-        # DYNAMIC LOOKAHEAD CAPPED (Crucial for Speed 10!)
-        dynamic_lookahead = 70.0 + (self.current_actual_speed * 30.0)
-        dynamic_lookahead = min(dynamic_lookahead, height * 0.85) # Prevents looking off-screen
+        dynamic_lookahead = 70.0 + (self.current_actual_speed * 40.0)
         if dy < dynamic_lookahead:
             dy = dynamic_lookahead
 
@@ -329,7 +520,22 @@ class LineFollower(Node):
         raw_turn = (kp_angle * theta_error) + (kd_angle * derivative)
 
         smooth_turn = (0.65 * self.target_turn) + (0.35 * raw_turn)
-        self.last_turn_direction = float(np.clip(smooth_turn, -1.0, 1.0))
+        
+        # =========================================================
+        # SMART STRAIGHT CLAMPING
+        # =========================================================
+        if self.active_sign_command == "STRAIGHT":
+            if self.straight_phase in ("WAITING_ZERO", "BLIND_CROSSING"):
+                # Lock wheels strictly straight so it doesn't swerve into the gap
+                self.last_turn_direction = float(np.clip(smooth_turn, -0.10, 0.10))
+            elif self.straight_phase == "GENTLE_INCLINE":
+                # Allow it to incline toward the new path, but physically limit the turn 
+                # so it CANNOT violently swerve if it sees the horizontal crossroad lines!
+                self.last_turn_direction = float(np.clip(smooth_turn, -0.40, 0.40))
+            else:
+                self.last_turn_direction = float(np.clip(smooth_turn, -1.0, 1.0))
+        else:
+            self.last_turn_direction = float(np.clip(smooth_turn, -1.0, 1.0))
 
         # --- PRE-EMPTIVE BRAKING LOGIC ---
         approaching_target_qr = False
@@ -339,18 +545,19 @@ class LineFollower(Node):
             elif self.mission_state == "SEARCH_HOSPITAL" and self.sensed_qr == self.expected_hospital:
                 approaching_target_qr = True
 
-        # --- EXTREME SPEED MODULATION (Highest Priority First) ---
-        if approaching_target_qr:
-            # #1 PRIORITY: MUST be slow to stop accurately in the zone! Override all high speeds.
-            self.target_speed = 0.50   
-        elif abs(theta_error) > 0.35:
-            self.target_speed = 1.80   # Sharp corners (Increased)
+        # --- DYNAMIC SPEED MODULATION ---
+        if abs(theta_error) > 0.35:
+            self.target_speed = 0.45   # Sharp corners
         elif abs(theta_error) > 0.15:
-            self.target_speed = 3.50   # Mild corners (Increased)
+            self.target_speed = 0.80   # Mild corners
+        elif approaching_target_qr:
+            self.target_speed = 0.50   
+        elif self.active_sign_command == "STRAIGHT":
+            self.target_speed = 2.00
         elif self.active_sign_command is not None:
-            self.target_speed = 4.00   # Fast passing speed for signboards (Increased)
+            self.target_speed = 1.20   
         else:
-            self.target_speed = self.MAX_SPEED # SPEED 10.0 🚀
+            self.target_speed = self.MAX_SPEED
 
         self.target_turn = self.last_turn_direction
 
@@ -376,7 +583,12 @@ class LineFollower(Node):
 
         self.active_sign_command = None
         self.in_intersection = False
+        self.last_received_sign = None
+        self.sign_confirm_count = 0
         self.sign_command_timestamp = 0.0
+        self.straight_phase = None
+        self.straight_zero_start = 0.0
+        self.straight_follow_start = 0.0
 
         if self.mission_state == "SEARCH_PATIENT":
             resolved_patient = self.resolve_patient_payload(payload)
@@ -389,23 +601,20 @@ class LineFollower(Node):
             if resolved_hospital:
                 self.expected_hospital = resolved_hospital
                 self.target_letter = HOSPITAL_TO_SIGN[resolved_hospital]
-                self.mission_state = "SEARCH_HOSPITAL"
+                self.set_mission_state("SEARCH_HOSPITAL")
                 self.get_logger().info(f"✅ ASSIGNED HOSPITAL: {resolved_hospital} (Route Sign: {self.target_letter})")
 
         elif self.mission_state == "AT_HOSPITAL_ZONE_WAIT":
-            self.patients_delivered += 1
-            if self.patients_delivered >= 3:
-                self.mission_state = "EXIT_TO_PARK"
-                self.get_logger().info("✅ ALL PATIENTS DELIVERED: Proceeding to Park.")
-            else:
-                self.patient_index += 1
-                resolved_patient = self.resolve_patient_payload(payload)
-                self.target_letter = PATIENT_TO_SIGN[resolved_patient] if resolved_patient else self.patient_sequence[self.patient_index]
-                self.mission_state = "SEARCH_PATIENT"
-                self.get_logger().info(f"✅ NEXT PATIENT: Proceed to {self.target_letter}")
+            # Server responded with next patient assignment (deliveries 1 & 2 only)
+            # NOTE: patients_delivered is incremented in check_zone_arrival(), not here
+            self.patient_index += 1
+            resolved_patient = self.resolve_patient_payload(payload)
+            self.target_letter = PATIENT_TO_SIGN[resolved_patient] if resolved_patient else self.patient_sequence[min(self.patient_index, len(self.patient_sequence) - 1)]
+            self.set_mission_state("SEARCH_PATIENT")
+            self.get_logger().info(f"✅ NEXT PATIENT: Proceed to {self.target_letter}")
 
         elif self.mission_state == "PARKED_WAIT_ACK":
-            if payload == "OK": self.mission_state = "DONE"
+            if payload == "OK": self.set_mission_state("DONE")
 
     def send_server_update(self, text_msg):
         m = ServerCommunication()
@@ -435,7 +644,12 @@ class LineFollower(Node):
                     self.sensed_qr = None
                     self.active_sign_command = None
                     self.in_intersection = False
+                    self.last_received_sign = None
+                    self.sign_confirm_count = 0
                     self.sign_command_timestamp = 0.0
+                    self.straight_phase = None
+                    self.straight_zero_start = 0.0
+                    self.straight_follow_start = 0.0
                     self.zone_stop_timer_start = 0.0
                     self.get_logger().info(f"🛑 CENTERED IN PATIENT ZONE: Stopped for {expected}")
 
@@ -447,19 +661,63 @@ class LineFollower(Node):
 
                 elif (time.time() - self.zone_stop_timer_start) >= self.ZONE_STOP_DELAY:
                     self.send_server_update(self.sensed_qr)
-                    self.mission_state = "AT_HOSPITAL_ZONE_WAIT"
                     self.sensed_qr = None
                     self.active_sign_command = None
                     self.in_intersection = False
+                    self.last_received_sign = None
+                    self.sign_confirm_count = 0
                     self.sign_command_timestamp = 0.0
+                    self.straight_phase = None
+                    self.straight_zero_start = 0.0
+                    self.straight_follow_start = 0.0
                     self.zone_stop_timer_start = 0.0
                     self.get_logger().info(f"🛑 CENTERED IN HOSPITAL ZONE: Stopped for {self.expected_hospital}")
+
+                    self.patients_delivered += 1
+                    if self.patients_delivered >= 1:
+                        # 3rd delivery done — go straight to parking, don't wait for server
+                        self.set_mission_state("EXIT_TO_PARK")
+                        self.parking_phase = 0
+                        self.parking_start_time = time.time()
+                        self.parking_start_x = self.odom_x
+                        self.parking_start_y = self.odom_y
+                        self.get_logger().info("✅ ALL PATIENTS DELIVERED: Proceeding to Park.")
+                    else:
+                        self.mission_state = "AT_HOSPITAL_ZONE_WAIT"
 
     def qr_detection_callback(self, message):
         qr_data = self.normalize_qr_payload(message.data)
         if qr_data in FAKE_HOSPITALS: return
         self.sensed_qr = qr_data
         self.check_zone_arrival()
+
+    def odometry_callback(self, message):
+        """Track buggy position for distance-based cone suppression."""
+        self.odom_x = message.pose.pose.position.x
+        self.odom_y = message.pose.pose.position.y
+
+    def cone_detection_callback(self, message):
+        """Receive cone detection from camera node — primary parking detector."""
+        if self.mission_state != "EXIT_TO_PARK" or self.parking_phase != 0:
+            return
+
+        # Ignore camera detections until buggy has traveled past hospital pillars
+        dist = math.sqrt((self.odom_x - self.parking_start_x)**2 +
+                         (self.odom_y - self.parking_start_y)**2)
+        if dist < self.CONE_DETECT_MIN_DIST:
+            return
+
+        # Parse: "CONES_LEFT_5" or "CONES_RIGHT_3" or "CONES_CENTER_4"
+        parts = message.data.split('_')
+        if len(parts) >= 2 and parts[0] == "CONES":
+            direction = parts[1]  # LEFT, RIGHT, or CENTER
+            if direction in ["LEFT", "RIGHT"]:
+                self.parking_cone_side = direction
+                self.parking_phase = 1
+                self.parking_timer_start = time.time()
+                self.get_logger().info(
+                    f"📷 CAMERA: Cones detected to {direction}! → Clearing cones to reverse."
+                )
 
     def sign_board_callback(self, message):
         parts = message.data.upper().strip().split('_', 1)
@@ -474,10 +732,21 @@ class LineFollower(Node):
         if getattr(self, 'in_intersection', False) and self.active_sign_command is not None:
             return
 
-        if self.active_sign_command != direction:
-            self.active_sign_command = direction
-            self.sign_command_timestamp = time.time()
-            self.get_logger().warn(f"🎯 MATCHED TARGET SIGN ({letter})! Intent CONFIRMED & LOCKED: {direction}")
+        if getattr(self, 'last_received_sign', None) == f"{letter}_{direction}":
+            self.sign_confirm_count = getattr(self, 'sign_confirm_count', 0) + 1
+        else:
+            self.last_received_sign = f"{letter}_{direction}"
+            self.sign_confirm_count = 1
+
+        if self.sign_confirm_count >= 2:
+            if self.active_sign_command != direction:
+                self.active_sign_command = direction
+                self.sign_command_timestamp = time.time()
+                if direction == "STRAIGHT":
+                    self.straight_phase = "WAITING_ZERO"
+                    self.straight_zero_start = 0.0
+                    self.straight_follow_start = 0.0
+                self.get_logger().info(f"🎯 MATCHED TARGET SIGN ({letter})! Intent CONFIRMED & LOCKED: {direction}")
 
 
 def main(args=None):
